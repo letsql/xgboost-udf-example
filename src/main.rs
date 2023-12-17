@@ -1,48 +1,19 @@
-extern crate xgboost;
-
-use datafusion::arrow::array::DictionaryArray;
-use datafusion::arrow::array::{Array, ArrayRef, StringArray};
-use datafusion::arrow::array::{BooleanBuilder, ListBuilder, StringBuilder, StructBuilder};
-use datafusion::arrow::datatypes::DataType;
-use datafusion::arrow::datatypes::Int32Type;
-use datafusion::arrow::datatypes::{Field, Fields};
-use datafusion::error::Result;
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray, ListBuilder, StringArray,
+    StringBuilder, StructBuilder,
+};
+use datafusion::arrow::array::{ListArray, StructArray};
+use datafusion::arrow::datatypes::{DataType, Field, Fields, Int32Type};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{create_udf, Volatility};
 use datafusion::physical_plan::functions::make_scalar_function;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
-use xgboost::{parameters, Booster, DMatrix};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ScalarValue {
-    Utf8(Option<String>),
-}
-
-macro_rules! typed_cast {
-    ($array:expr, $index:expr, $ARRAYTYPE:ident, $SCALAR:ident) => {{
-        let array = $array.as_any().downcast_ref::<$ARRAYTYPE>().unwrap();
-        ScalarValue::$SCALAR(match array.is_null($index) {
-            true => None,
-            false => Some(array.value($index).into()),
-        })
-    }};
-}
-
-impl ScalarValue {
-    pub fn try_from_array(array: &ArrayRef, index: usize) -> Result<Self, String> {
-        match array.data_type() {
-            DataType::Utf8 => Ok(typed_cast!(array, index, StringArray, Utf8)),
-            _ => Err(format!(
-                "Unsupported data type {:?} for ScalarValue",
-                array.data_type()
-            )),
-        }
-    }
 }
 
 fn onehot(args: &[ArrayRef]) -> Result<ArrayRef> {
@@ -54,14 +25,14 @@ fn onehot(args: &[ArrayRef]) -> Result<ArrayRef> {
     let (key, values) = data.into_parts();
     let values = values.as_any().downcast_ref::<StringArray>().unwrap();
 
-    let new_struct = StructBuilder::from_fields(
+    let struct_builder = StructBuilder::from_fields(
         Fields::from(vec![
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Boolean, false),
         ]),
         2,
     );
-    let mut list_builder = ListBuilder::new(new_struct);
+    let mut list_builder = ListBuilder::new(struct_builder);
     for i in 0..key.len() {
         for j in 0..values.len() {
             let key_value = key.value(i) as usize;
@@ -95,7 +66,6 @@ pub fn register_udfs(ctx: &SessionContext) {
     ]));
 
     let list_field = Field::new("item", struct_type, true);
-
     let list_type = DataType::List(Arc::new(list_field));
     let onehot_udf = create_udf(
         "onehot",
@@ -110,64 +80,104 @@ pub fn register_udfs(ctx: &SessionContext) {
     ctx.register_udf(onehot_udf);
 }
 
+pub fn convert_to_native(batch: &RecordBatch) -> Result<Vec<bool>, DataFusionError> {
+    let array = batch.columns()[0]
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| DataFusionError::Internal("Expected ListArray".to_string()))?;
+
+    let mut result = Vec::new();
+
+    for maybe_struct in array.iter() {
+        if let Some(struct_val) = maybe_struct {
+            let struct_array = struct_val
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| DataFusionError::Internal("Expected StructArray".to_string()))?;
+
+            let boolean_array = struct_array
+                .column(1)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| DataFusionError::Internal("Expected BooleanArray".to_string()))?;
+
+            result.push(boolean_array.value(0));
+        } else {
+            return Err(DataFusionError::Internal(
+                "Null struct in ListArray".to_string(),
+            ));
+        }
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use datafusion::arrow::util::pretty::print_batches;
-    use datafusion::prelude::CsvReadOptions;
+    use datafusion::arrow::array::UInt8Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::assert_batches_eq;
+    use datafusion::datasource::MemTable;
 
-    #[tokio::test]
-    pub async fn test_recordbatch_downcast() -> Result<()> {
-        let ctx = SessionContext::new();
-        let _ = ctx
-            .register_csv("data", "./data/mushrooms.csv", CsvReadOptions::default())
-            .await?;
+    fn create_record_batch() -> Result<RecordBatch> {
+        let id_array = UInt8Array::from(vec![1, 2]);
+        let account_array = StringArray::from(vec![Some("a"), Some("b")]);
 
-        let batches = ctx.sql("SELECT class FROM data").await?.collect().await?;
-        let array = batches[0].column(0);
-
-        match array.data_type() {
-            DataType::Utf8 => {
-                let array = array.as_any().downcast_ref::<StringArray>().unwrap();
-                println!("{:?}", array);
-            }
-            _ => println!(
-                "Unsupported data type {:?} for ScalarValue",
-                array.data_type()
-            ),
-        }
-        Ok(())
+        Ok(RecordBatch::try_new(
+            get_schema(),
+            vec![Arc::new(id_array), Arc::new(account_array)],
+        )
+        .unwrap())
     }
 
-    #[tokio::test]
-    pub async fn test_scalar_value() -> Result<()> {
-        let ctx = SessionContext::new();
-        let _ = ctx
-            .register_csv("data", "./data/mushrooms.csv", CsvReadOptions::default())
-            .await?;
-        let batches = ctx.sql("SELECT class FROM data").await?.collect().await?;
-        let array = batches[0].column(0);
-        let result = ScalarValue::try_from_array(&array, 0).unwrap();
-
-        println!("{:?}", result);
-        Ok(())
+    pub fn get_schema() -> SchemaRef {
+        SchemaRef::new(Schema::new(vec![
+            Field::new("id", DataType::UInt8, false),
+            Field::new("class", DataType::Utf8, true),
+        ]))
     }
 
     #[tokio::test]
     pub async fn test_onehot() -> Result<()> {
+        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
         let ctx = SessionContext::new();
         register_udfs(&ctx);
-        let _ = ctx
-            .register_csv("data", "./data/mushrooms.csv", CsvReadOptions::default())
-            .await?;
+        ctx.register_table("training", Arc::new(mem_table))?;
         let batches = ctx
-            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class FROM data")
+            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class FROM training")
             .await?
             .collect()
             .await?;
-        print_batches(&batches).unwrap();
-        let array = batches[0].column(0);
-        assert_eq!(array.len(), 8124);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].columns()[0].len(), 2);
+        let expected = [
+            r#"+-------------------------------------------------+"#,
+            r#"| class                                           |"#,
+            r#"+-------------------------------------------------+"#,
+            r#"| [{key: a, value: true}, {key: b, value: false}] |"#,
+            r#"| [{key: a, value: false}, {key: b, value: true}] |"#,
+            r#"+-------------------------------------------------+"#,
+        ];
+        assert_batches_eq!(expected, &batches);
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_onehot_to_vec() -> Result<()> {
+        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
+        let ctx = SessionContext::new();
+        register_udfs(&ctx);
+        ctx.register_table("training", Arc::new(mem_table))?;
+        let batches = ctx
+            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class FROM training")
+            .await?
+            .collect()
+            .await?;
+
+        let result = convert_to_native(&batches[0])?;
+        assert_eq!(result, vec![true, false]);
         Ok(())
     }
 }
