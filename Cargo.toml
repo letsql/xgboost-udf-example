@@ -1,5 +1,5 @@
 [package]
-name = "xgboost-udf-example"
+name = "xgboost_udf_example"
 version = "0.1.0"
 edition = "2021"
 

@@ -11,10 +11,6 @@ use datafusion::physical_plan::functions::make_scalar_function;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    Ok(())
-}
 
 fn onehot(args: &[ArrayRef]) -> Result<ArrayRef> {
     let data = args[0]
