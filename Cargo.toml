@@ -8,5 +8,5 @@ edition = "2021"
 [dependencies]
 datafusion = "34.0.0"
 tokio = { version = "1.35.0", features = ["full"] }
-
+xgboost = "0.1.4"
 

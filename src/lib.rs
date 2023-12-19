@@ -1,8 +1,7 @@
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray, ListBuilder, StringArray,
-    StringBuilder, StructBuilder,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray, ListArray, ListBuilder,
+    StringArray, StringBuilder, StructArray, StructBuilder,
 };
-use datafusion::arrow::array::{ListArray, StructArray};
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Int32Type};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
@@ -10,7 +9,7 @@ use datafusion::logical_expr::{create_udf, Volatility};
 use datafusion::physical_plan::functions::make_scalar_function;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
-
+use xgboost::DMatrix;
 
 fn onehot(args: &[ArrayRef]) -> Result<ArrayRef> {
     let data = args[0]
@@ -50,7 +49,6 @@ fn onehot(args: &[ArrayRef]) -> Result<ArrayRef> {
         list_builder.append(true);
     }
     let list_array = list_builder.finish();
-
     Ok(Arc::new(list_array))
 }
 
@@ -69,14 +67,16 @@ pub fn register_udfs(ctx: &SessionContext) {
             Box::new(DataType::Int32),
             Box::new(DataType::Utf8),
         )],
-        Arc::new(list_type), //vec![DataType::Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Boolean))],
+        Arc::new(list_type),
         Volatility::Immutable,
         onehot,
     );
+
     ctx.register_udf(onehot_udf);
 }
 
-pub fn convert_to_native(batch: &RecordBatch) -> Result<Vec<bool>, DataFusionError> {
+pub fn convert_to_native(batch: &RecordBatch) -> Result<(Vec<bool>, usize), DataFusionError> {
+    let num_rows = batch.num_rows();
     let array = batch.columns()[0]
         .as_any()
         .downcast_ref::<ListArray>()
@@ -104,8 +104,18 @@ pub fn convert_to_native(batch: &RecordBatch) -> Result<Vec<bool>, DataFusionErr
             ));
         }
     }
+    Ok((result, num_rows))
+}
 
-    Ok(result)
+pub fn create_dmatrix(data: Vec<bool>, num_rows: usize) -> Result<DMatrix, DataFusionError> {
+    //convert data from bool to Vec<f32>
+    let data_transform = data
+        .into_iter()
+        .map(|x| x as u8 as f32)
+        .collect::<Vec<f32>>();
+    let dmat = DMatrix::from_dense(&data_transform, num_rows)
+        .map_err(|_| DataFusionError::Internal("Failed to create dmatrix".to_string()))?;
+    Ok(dmat)
 }
 
 #[cfg(test)]
@@ -172,8 +182,27 @@ mod test {
             .collect()
             .await?;
 
-        let result = convert_to_native(&batches[0])?;
+        let (result, num_rows) = convert_to_native(&batches[0])?;
         assert_eq!(result, vec![true, false]);
+        assert_eq!(num_rows, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_build_dmatrix() -> Result<()> {
+        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
+        let ctx = SessionContext::new();
+        register_udfs(&ctx);
+        ctx.register_table("training", Arc::new(mem_table))?;
+        let batches = ctx
+            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class FROM training")
+            .await?
+            .collect()
+            .await?;
+
+        let (data, num_rows) = convert_to_native(&batches[0])?;
+        let dm = create_dmatrix(data, num_rows)?;
+        assert_eq!(dm.shape(), (2, 1));
         Ok(())
     }
 }
