@@ -158,7 +158,8 @@ pub fn records_to_dense(
     Ok((result, num_rows, dim_names))
 }
 
-pub fn create_dmatrix(data: Vec<bool>, num_rows: usize) -> Result<DMatrix, DataFusionError> {
+pub fn create_dmatrix(data: &RecordBatch) -> Result<DMatrix, DataFusionError> {
+    let (data, num_rows, _) = records_to_dense(data)?;
     let data_transform = data
         .into_iter()
         .map(|x| x as u8 as f32)
@@ -284,14 +285,14 @@ mod test {
         register_udfs(&ctx);
         ctx.register_table("training", Arc::new(mem_table))?;
         let batches = ctx
-            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class FROM training")
+            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class, onehot(arrow_cast(id, 'Dictionary(Int32, Utf8)')) as id FROM training")
             .await?
             .collect()
             .await?;
 
-        let (data, num_rows) = convert_to_native(&batches[0].column(0), 1)?;
-        let dm = create_dmatrix(data, num_rows)?;
-        assert_eq!(dm.shape(), (2, 1));
+        // X, y is class label but not necessary to build a a DMatrix
+        let dm = create_dmatrix(&batches[0])?;
+        assert_eq!(dm.shape(), (2, 4));
         Ok(())
     }
 }
