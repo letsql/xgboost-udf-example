@@ -75,13 +75,16 @@ pub fn register_udfs(ctx: &SessionContext) {
     ctx.register_udf(onehot_udf);
 }
 
-pub fn convert_to_native(batch: &RecordBatch) -> Result<(Vec<bool>, usize), DataFusionError> {
-    let num_rows = batch.num_rows();
-    let array = batch.columns()[0]
+pub fn convert_to_native(
+    batch: &ArrayRef,
+    column: usize,
+) -> Result<(Vec<bool>, usize), DataFusionError> {
+    let array = batch
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| DataFusionError::Internal("Expected ListArray".to_string()))?;
 
+    let num_rows = array.len();
     let mut result = Vec::new();
 
     for maybe_struct in array.iter() {
@@ -97,7 +100,7 @@ pub fn convert_to_native(batch: &RecordBatch) -> Result<(Vec<bool>, usize), Data
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| DataFusionError::Internal("Expected BooleanArray".to_string()))?;
 
-            result.push(boolean_array.value(0));
+            result.push(boolean_array.value(column));
         } else {
             return Err(DataFusionError::Internal(
                 "Null struct in ListArray".to_string(),
@@ -107,8 +110,55 @@ pub fn convert_to_native(batch: &RecordBatch) -> Result<(Vec<bool>, usize), Data
     Ok((result, num_rows))
 }
 
+pub fn to_dense(batch: &ArrayRef) -> Result<(Vec<bool>, usize, Vec<String>), DataFusionError> {
+    let array = batch
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| DataFusionError::Internal("Expected ListArray".to_string()))?;
+
+    let mut result = Vec::new();
+    let first_item = array.value(0);
+    let struct_array = first_item
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| DataFusionError::Internal("Expected StructArray".to_string()))?;
+    let string_array = struct_array
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| DataFusionError::Internal("Expected BooleanArray".to_string()))?;
+
+    let mut num = 0;
+    for i in 0..string_array.len() {
+        let (single, num_rows) = convert_to_native(batch, i)?;
+        result.push(single);
+        num = num_rows;
+    }
+    let flattened = result.into_iter().flatten().collect();
+    let dim_names = string_array
+        .into_iter()
+        .map(|x| x.unwrap().to_string())
+        .collect();
+    Ok((flattened, num, dim_names))
+}
+
+pub fn records_to_dense(
+    batch: &RecordBatch,
+) -> Result<(Vec<bool>, usize, Vec<String>), DataFusionError> {
+    let mut result = Vec::new();
+    let mut num_rows = 0;
+    let mut dim_names = Vec::new();
+
+    for i in 0..batch.num_columns() {
+        let (result_col, num_rows_col, dim_names_col) = to_dense(&batch.column(i))?;
+        result.extend(result_col);
+        num_rows = num_rows_col;
+        dim_names.extend(dim_names_col);
+    }
+    Ok((result, num_rows, dim_names))
+}
+
 pub fn create_dmatrix(data: Vec<bool>, num_rows: usize) -> Result<DMatrix, DataFusionError> {
-    //convert data from bool to Vec<f32>
     let data_transform = data
         .into_iter()
         .map(|x| x as u8 as f32)
@@ -121,14 +171,13 @@ pub fn create_dmatrix(data: Vec<bool>, num_rows: usize) -> Result<DMatrix, DataF
 #[cfg(test)]
 mod test {
     use super::*;
-    use datafusion::arrow::array::UInt8Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::assert_batches_eq;
     use datafusion::datasource::MemTable;
 
     fn create_record_batch() -> Result<RecordBatch> {
-        let id_array = UInt8Array::from(vec![1, 2]);
+        let id_array = StringArray::from(vec![Some("c"), Some("d")]);
         let account_array = StringArray::from(vec![Some("a"), Some("b")]);
 
         Ok(RecordBatch::try_new(
@@ -140,7 +189,7 @@ mod test {
 
     pub fn get_schema() -> SchemaRef {
         SchemaRef::new(Schema::new(vec![
-            Field::new("id", DataType::UInt8, false),
+            Field::new("id", DataType::Utf8, true),
             Field::new("class", DataType::Utf8, true),
         ]))
     }
@@ -182,9 +231,49 @@ mod test {
             .collect()
             .await?;
 
-        let (result, num_rows) = convert_to_native(&batches[0])?;
+        let (result, num_rows) = convert_to_native(&batches[0].column(0), 0)?;
         assert_eq!(result, vec![true, false]);
         assert_eq!(num_rows, 2);
+        let (result, num_rows) = convert_to_native(&batches[0].column(0), 1)?;
+        assert_eq!(result, vec![false, true]);
+        assert_eq!(num_rows, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_onehot_to_dense() -> Result<()> {
+        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
+        let ctx = SessionContext::new();
+        register_udfs(&ctx);
+        ctx.register_table("training", Arc::new(mem_table))?;
+        let batches = ctx
+            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class FROM training")
+            .await?
+            .collect()
+            .await?;
+
+        let (result, num_rows, dim_names) = to_dense(&batches[0].column(0))?;
+        assert_eq!(result.len(), 4);
+        assert_eq!(num_rows, 2);
+        assert_eq!(dim_names, vec!["a", "b"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_records_to_dense() -> Result<()> {
+        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
+        let ctx = SessionContext::new();
+        register_udfs(&ctx);
+        ctx.register_table("training", Arc::new(mem_table))?;
+        let batches = ctx
+            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class, onehot(arrow_cast(id, 'Dictionary(Int32, Utf8)')) as id FROM training")
+            .await?
+            .collect()
+            .await?;
+        let (result, num_rows, dim_names) = records_to_dense(&batches[0])?;
+        assert_eq!(result.len(), 8);
+        assert_eq!(num_rows, 2);
+        assert_eq!(dim_names, vec!["a", "b", "c", "d"]);
         Ok(())
     }
 
@@ -200,7 +289,7 @@ mod test {
             .collect()
             .await?;
 
-        let (data, num_rows) = convert_to_native(&batches[0])?;
+        let (data, num_rows) = convert_to_native(&batches[0].column(0), 1)?;
         let dm = create_dmatrix(data, num_rows)?;
         assert_eq!(dm.shape(), (2, 1));
         Ok(())
