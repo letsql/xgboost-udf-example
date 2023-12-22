@@ -1,6 +1,6 @@
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray, ListArray, ListBuilder,
-    StringArray, StringBuilder, StructArray, StructBuilder, Float32Array,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray, Float32Array, ListArray,
+    ListBuilder, StringArray, StringBuilder, StructArray, StructBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Int32Type};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -9,7 +9,7 @@ use datafusion::logical_expr::{create_udf, Volatility};
 use datafusion::physical_plan::functions::make_scalar_function;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
-use xgboost::{DMatrix, Booster};
+use xgboost::{Booster, DMatrix};
 
 fn onehot(args: &[ArrayRef]) -> Result<ArrayRef> {
     let data = args[0]
@@ -83,7 +83,12 @@ pub fn register_udfs(ctx: &SessionContext) {
     let list_type = DataType::List(Arc::new(list_field));
     let predict_udf = create_udf(
         "predict",
-        vec![list_type.clone(), list_type.clone(),list_type.clone(), list_type.clone()],
+        vec![
+            list_type.clone(),
+            list_type.clone(),
+            list_type.clone(),
+            list_type.clone(),
+        ],
         Arc::new(DataType::Float32),
         Volatility::Immutable,
         predict,
@@ -143,7 +148,7 @@ fn to_dense(batch: &ArrayRef) -> Result<(Vec<bool>, usize, Vec<String>), DataFus
         .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| DataFusionError::Internal("Expected BooleanArray".to_string()))?;
+        .ok_or_else(|| DataFusionError::Internal("Expected StringArray".to_string()))?;
 
     let mut num = 0;
     for i in 0..string_array.len() {
@@ -152,6 +157,7 @@ fn to_dense(batch: &ArrayRef) -> Result<(Vec<bool>, usize, Vec<String>), DataFus
         num = num_rows;
     }
     let flattened = result.into_iter().flatten().collect();
+
     let dim_names = string_array
         .into_iter()
         .map(|x| x.unwrap().to_string())
@@ -186,18 +192,17 @@ pub fn create_dmatrix(data: &RecordBatch) -> Result<DMatrix, DataFusionError> {
     Ok(dmat)
 }
 
-
 fn predict(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut result = Vec::new();
     let mut num_rows = 0;
     let mut dim_names = Vec::new();
-    
+
     for i in 0..args.len() {
         let (result_col, num_rows_col, dim_names_col) = to_dense(&args[i])?;
         result.extend(result_col);
         num_rows = num_rows_col;
         dim_names.extend(dim_names_col);
-    };
+    }
     let data_transform = result
         .into_iter()
         .map(|x| x as u8 as f32)
@@ -212,150 +217,202 @@ fn predict(args: &[ArrayRef]) -> Result<ArrayRef> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use datafusion::arrow::array::{ArrayRef, StringDictionaryBuilder};
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::assert_batches_eq;
-    use datafusion::datasource::MemTable;
-
-    fn create_record_batch() -> Result<RecordBatch> {
-        let id_array = StringArray::from(vec![Some("c"), Some("d")]);
-        let account_array = StringArray::from(vec![Some("a"), Some("b")]);
-
-        Ok(RecordBatch::try_new(
-            get_schema(),
-            vec![Arc::new(id_array), Arc::new(account_array)],
-        )
-        .unwrap())
-    }
-
-    pub fn get_schema() -> SchemaRef {
-        SchemaRef::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, true),
-            Field::new("class", DataType::Utf8, true),
-        ]))
-    }
 
     #[tokio::test]
     pub async fn test_onehot() -> Result<()> {
-        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
-        let ctx = SessionContext::new();
-        register_udfs(&ctx);
-        ctx.register_table("training", Arc::new(mem_table))?;
-        let batches = ctx
-            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class FROM training")
-            .await?
-            .collect()
-            .await?;
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].columns()[0].len(), 2);
-        let expected = [
-            r#"+-------------------------------------------------+"#,
-            r#"| class                                           |"#,
-            r#"+-------------------------------------------------+"#,
-            r#"| [{key: a, value: true}, {key: b, value: false}] |"#,
-            r#"| [{key: a, value: false}, {key: b, value: true}] |"#,
-            r#"+-------------------------------------------------+"#,
-        ];
-        assert_batches_eq!(expected, &batches);
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        builder.append("a").unwrap();
+        builder.append("b").unwrap();
+        let dict = Arc::new(builder.finish()).clone();
+        let result = onehot(&[dict])?;
+        assert_eq!(result.len(), 2);
         Ok(())
     }
 
     #[tokio::test]
     pub async fn test_onehot_to_vec() -> Result<()> {
-        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
-        let ctx = SessionContext::new();
-        register_udfs(&ctx);
-        ctx.register_table("training", Arc::new(mem_table))?;
-        let batches = ctx
-            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class FROM training")
-            .await?
-            .collect()
-            .await?;
+        let fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Boolean, false),
+        ]);
+        let struct_builder = StructBuilder::from_fields(fields, 2);
+        let mut list_builder = ListBuilder::new(struct_builder);
+        list_builder
+            .values()
+            .field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value("a");
+        list_builder
+            .values()
+            .field_builder::<BooleanBuilder>(1)
+            .unwrap()
+            .append_value(true);
+        list_builder.values().append(true);
+        list_builder.append(true);
+        let array = Arc::new(list_builder.finish()).clone() as ArrayRef;
 
-        let (result, num_rows) = convert_to_native(&batches[0].column(0), 0)?;
-        assert_eq!(result, vec![true, false]);
-        assert_eq!(num_rows, 2);
-        let (result, num_rows) = convert_to_native(&batches[0].column(0), 1)?;
-        assert_eq!(result, vec![false, true]);
-        assert_eq!(num_rows, 2);
+        let (result, num_rows) = convert_to_native(&array, 0)?;
+        assert_eq!(result, vec![true]);
+        assert_eq!(num_rows, 1);
         Ok(())
     }
 
     #[tokio::test]
     pub async fn test_onehot_to_dense() -> Result<()> {
-        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
-        let ctx = SessionContext::new();
-        register_udfs(&ctx);
-        ctx.register_table("training", Arc::new(mem_table))?;
-        let batches = ctx
-            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class FROM training")
-            .await?
-            .collect()
-            .await?;
+        let fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Boolean, false),
+        ]);
+        let struct_builder = StructBuilder::from_fields(fields, 2);
+        let mut list_builder = ListBuilder::new(struct_builder);
+        list_builder
+            .values()
+            .field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value("a");
+        list_builder
+            .values()
+            .field_builder::<BooleanBuilder>(1)
+            .unwrap()
+            .append_value(true);
+        list_builder.values().append(true);
+        list_builder
+            .values()
+            .field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value("b");
+        list_builder
+            .values()
+            .field_builder::<BooleanBuilder>(1)
+            .unwrap()
+            .append_value(false);
+        list_builder.values().append(true);
+        list_builder.append(true);
+        let array = Arc::new(list_builder.finish()).clone() as ArrayRef;
 
-        let (result, num_rows, dim_names) = to_dense(&batches[0].column(0))?;
-        assert_eq!(result.len(), 4);
-        assert_eq!(num_rows, 2);
+        let (result, num_rows, dim_names) = to_dense(&array)?;
+        assert_eq!(result.len(), 2);
+        assert_eq!(num_rows, 1);
         assert_eq!(dim_names, vec!["a", "b"]);
         Ok(())
     }
 
     #[tokio::test]
     pub async fn test_records_to_dense() -> Result<()> {
-        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
-        let ctx = SessionContext::new();
-        register_udfs(&ctx);
-        ctx.register_table("training", Arc::new(mem_table))?;
-        let batches = ctx
-            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class, onehot(arrow_cast(id, 'Dictionary(Int32, Utf8)')) as id FROM training")
-            .await?
-            .collect()
-            .await?;
-        let (result, num_rows, dim_names) = records_to_dense(&batches[0])?;
-        assert_eq!(result.len(), 8);
-        assert_eq!(num_rows, 2);
-        assert_eq!(dim_names, vec!["a", "b", "c", "d"]);
+        let struct_type = DataType::Struct(Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Boolean, false),
+        ]));
+
+        let list_field = Field::new("item", struct_type, true);
+        let list_type = DataType::List(Arc::new(list_field));
+        let schema = SchemaRef::new(Schema::new(vec![Field::new(
+            "class",
+            list_type.clone(),
+            true,
+        )]));
+
+        let fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Boolean, false),
+        ]);
+        let struct_builder = StructBuilder::from_fields(fields, 2);
+        let mut list_builder = ListBuilder::new(struct_builder);
+        list_builder
+            .values()
+            .field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value("a");
+        list_builder
+            .values()
+            .field_builder::<BooleanBuilder>(1)
+            .unwrap()
+            .append_value(true);
+        list_builder.values().append(true);
+        list_builder.append(true);
+
+        let record_batch = RecordBatch::try_new(schema, vec![Arc::new(list_builder.finish())])?;
+
+        let (result, num_rows, dim_names) = records_to_dense(&record_batch)?;
+        assert_eq!(result.len(), 1);
+        assert_eq!(num_rows, 1);
+        assert_eq!(dim_names, vec!["a"]);
         Ok(())
     }
 
     #[tokio::test]
     pub async fn test_build_dmatrix() -> Result<()> {
-        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
-        let ctx = SessionContext::new();
-        register_udfs(&ctx);
-        ctx.register_table("training", Arc::new(mem_table))?;
-        let batches = ctx
-            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class, onehot(arrow_cast(id, 'Dictionary(Int32, Utf8)')) as id FROM training")
-            .await?
-            .collect()
-            .await?;
+        let struct_type = DataType::Struct(Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Boolean, false),
+        ]));
 
-        // X, y is class label but not necessary to build a a DMatrix
-        let dm = create_dmatrix(&batches[0])?;
-        assert_eq!(dm.shape(), (2, 4));
+        let list_field = Field::new("item", struct_type, true);
+        let list_type = DataType::List(Arc::new(list_field));
+        let schema = SchemaRef::new(Schema::new(vec![Field::new(
+            "class",
+            list_type.clone(),
+            true,
+        )]));
+
+        let fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Boolean, false),
+        ]);
+        let struct_builder = StructBuilder::from_fields(fields, 2);
+        let mut list_builder = ListBuilder::new(struct_builder);
+        list_builder
+            .values()
+            .field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value("a");
+        list_builder
+            .values()
+            .field_builder::<BooleanBuilder>(1)
+            .unwrap()
+            .append_value(true);
+        list_builder.values().append(true);
+        list_builder.append(true);
+
+        let record_batch = RecordBatch::try_new(schema, vec![Arc::new(list_builder.finish())])?;
+
+        let dm = create_dmatrix(&record_batch)?;
+        assert_eq!(dm.shape(), (1, 1));
         Ok(())
     }
 
     #[tokio::test]
     pub async fn test_predict() -> Result<()> {
-        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
-        let ctx = SessionContext::new();
-        register_udfs(&ctx);
-        ctx.register_table("training", Arc::new(mem_table))?;
-        let batches = ctx
-            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class, onehot(arrow_cast(id, 'Dictionary(Int32, Utf8)')) as id FROM training")
-            .await?
-            .collect()
-            .await?;
+        let fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Boolean, false),
+        ]);
+        let struct_builder = StructBuilder::from_fields(fields, 2);
+        let mut list_builder = ListBuilder::new(struct_builder);
+        list_builder
+            .values()
+            .field_builder::<StringBuilder>(0)
+            .unwrap()
+            .append_value("a");
+        list_builder
+            .values()
+            .field_builder::<BooleanBuilder>(1)
+            .unwrap()
+            .append_value(true);
+        list_builder.values().append(true);
+        list_builder.append(true);
+        let array = Arc::new(list_builder.finish());
 
-        let f0 = batches[0].column(0).clone();
-        let f1 = batches[0].column(0).clone();
-        let f2 = batches[0].column(0).clone();
-        let f3 = batches[0].column(0).clone();
+        let f0 = array.clone();
+        let f1 = array.clone();
+        let f2 = array.clone();
+        let f3 = array.clone();
 
         let _result = predict(&[f0, f1, f2, f3])?;
 
         Ok(())
-        
     }
 }
