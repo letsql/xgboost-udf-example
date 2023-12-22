@@ -1,6 +1,6 @@
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray, ListArray, ListBuilder,
-    StringArray, StringBuilder, StructArray, StructBuilder,
+    StringArray, StringBuilder, StructArray, StructBuilder, Float32Array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Int32Type};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -9,7 +9,7 @@ use datafusion::logical_expr::{create_udf, Volatility};
 use datafusion::physical_plan::functions::make_scalar_function;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
-use xgboost::DMatrix;
+use xgboost::{DMatrix, Booster};
 
 fn onehot(args: &[ArrayRef]) -> Result<ArrayRef> {
     let data = args[0]
@@ -73,6 +73,23 @@ pub fn register_udfs(ctx: &SessionContext) {
     );
 
     ctx.register_udf(onehot_udf);
+    let predict = make_scalar_function(predict);
+    let struct_type = DataType::Struct(Fields::from(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Boolean, false),
+    ]));
+
+    let list_field = Field::new("item", struct_type, true);
+    let list_type = DataType::List(Arc::new(list_field));
+    let predict_udf = create_udf(
+        "predict",
+        vec![list_type.clone(), list_type.clone(),list_type.clone(), list_type.clone()],
+        Arc::new(DataType::Float32),
+        Volatility::Immutable,
+        predict,
+    );
+
+    ctx.register_udf(predict_udf);
 }
 
 pub fn convert_to_native(
@@ -110,7 +127,7 @@ pub fn convert_to_native(
     Ok((result, num_rows))
 }
 
-pub fn to_dense(batch: &ArrayRef) -> Result<(Vec<bool>, usize, Vec<String>), DataFusionError> {
+fn to_dense(batch: &ArrayRef) -> Result<(Vec<bool>, usize, Vec<String>), DataFusionError> {
     let array = batch
         .as_any()
         .downcast_ref::<ListArray>()
@@ -142,7 +159,7 @@ pub fn to_dense(batch: &ArrayRef) -> Result<(Vec<bool>, usize, Vec<String>), Dat
     Ok((flattened, num, dim_names))
 }
 
-pub fn records_to_dense(
+fn records_to_dense(
     batch: &RecordBatch,
 ) -> Result<(Vec<bool>, usize, Vec<String>), DataFusionError> {
     let mut result = Vec::new();
@@ -167,6 +184,29 @@ pub fn create_dmatrix(data: &RecordBatch) -> Result<DMatrix, DataFusionError> {
     let dmat = DMatrix::from_dense(&data_transform, num_rows)
         .map_err(|_| DataFusionError::Internal("Failed to create dmatrix".to_string()))?;
     Ok(dmat)
+}
+
+
+fn predict(args: &[ArrayRef]) -> Result<ArrayRef> {
+    let mut result = Vec::new();
+    let mut num_rows = 0;
+    let mut dim_names = Vec::new();
+    
+    for i in 0..args.len() {
+        let (result_col, num_rows_col, dim_names_col) = to_dense(&args[i])?;
+        result.extend(result_col);
+        num_rows = num_rows_col;
+        dim_names.extend(dim_names_col);
+    };
+    let data_transform = result
+        .into_iter()
+        .map(|x| x as u8 as f32)
+        .collect::<Vec<f32>>();
+    let dmat = DMatrix::from_dense(&data_transform, num_rows).unwrap();
+    let booster = Booster::load("model.xgb").unwrap();
+    let result = Float32Array::from(booster.predict(&dmat).unwrap());
+
+    Ok(Arc::new(result))
 }
 
 #[cfg(test)]
@@ -294,5 +334,28 @@ mod test {
         let dm = create_dmatrix(&batches[0])?;
         assert_eq!(dm.shape(), (2, 4));
         Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_predict() -> Result<()> {
+        let mem_table = MemTable::try_new(get_schema(), vec![vec![create_record_batch()?]])?;
+        let ctx = SessionContext::new();
+        register_udfs(&ctx);
+        ctx.register_table("training", Arc::new(mem_table))?;
+        let batches = ctx
+            .sql("SELECT onehot(arrow_cast(class, 'Dictionary(Int32, Utf8)')) as class, onehot(arrow_cast(id, 'Dictionary(Int32, Utf8)')) as id FROM training")
+            .await?
+            .collect()
+            .await?;
+
+        let f0 = batches[0].column(0).clone();
+        let f1 = batches[0].column(0).clone();
+        let f2 = batches[0].column(0).clone();
+        let f3 = batches[0].column(0).clone();
+
+        let _result = predict(&[f0, f1, f2, f3])?;
+
+        Ok(())
+        
     }
 }
