@@ -173,7 +173,7 @@ fn records_to_dense(
     let mut dim_names = Vec::new();
 
     for i in 0..batch.num_columns() {
-        let (result_col, num_rows_col, dim_names_col) = to_dense(&batch.column(i))?;
+        let (result_col, num_rows_col, dim_names_col) = to_dense(batch.column(i))?;
         result.extend(result_col);
         num_rows = num_rows_col;
         dim_names.extend(dim_names_col);
@@ -197,8 +197,8 @@ fn predict(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut num_rows = 0;
     let mut dim_names = Vec::new();
 
-    for i in 0..args.len() {
-        let (result_col, num_rows_col, dim_names_col) = to_dense(&args[i])?;
+    for arg in args {
+        let (result_col, num_rows_col, dim_names_col) = to_dense(arg)?;
         result.extend(result_col);
         num_rows = num_rows_col;
         dim_names.extend(dim_names_col);

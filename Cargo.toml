@@ -10,3 +10,9 @@ datafusion = "34.0.0"
 tokio = { version = "1.35.0", features = ["full"] }
 xgboost = "0.1.4"
 
+[dev-dependencies]
+criterion = { version = "0.5.1", features = ["html_reports", "async_futures","async_tokio"] }
+
+[[bench]]
+name = "mushrooms_prediction"
+harness = false
