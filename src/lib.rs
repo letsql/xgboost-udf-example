@@ -1,6 +1,6 @@
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray, Float32Array, ListArray,
-    ListBuilder, StringArray, StringBuilder, StructArray, StructBuilder,
+    as_dictionary_array, Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray,
+    Float32Array, ListArray, ListBuilder, StringArray, StringBuilder, StructArray, StructBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Int32Type};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -12,12 +12,10 @@ use std::sync::Arc;
 use xgboost::{Booster, DMatrix};
 
 fn onehot(args: &[ArrayRef]) -> Result<ArrayRef> {
-    let data = args[0]
-        .as_any()
-        .downcast_ref::<DictionaryArray<Int32Type>>()
-        .unwrap()
-        .clone();
-    let (key, values) = data.into_parts();
+    let data: &DictionaryArray<Int32Type> = as_dictionary_array::<_>(&args[0]);
+    let key = data.keys();
+    let values = data.values();
+
     let values = values.as_any().downcast_ref::<StringArray>().unwrap();
 
     let struct_builder = StructBuilder::from_fields(
@@ -33,7 +31,6 @@ fn onehot(args: &[ArrayRef]) -> Result<ArrayRef> {
             let key_value = key.value(i) as usize;
             let struct_key = values.value(j);
             let struct_value = j == key_value;
-
             list_builder
                 .values()
                 .field_builder::<StringBuilder>(0)
@@ -83,12 +80,7 @@ pub fn register_udfs(ctx: &SessionContext) {
     let list_type = DataType::List(Arc::new(list_field));
     let predict_udf = create_udf(
         "predict",
-        vec![
-            list_type.clone(),
-            list_type.clone(),
-            list_type.clone(),
-            list_type.clone(),
-        ],
+        vec![list_type.clone(); 21],
         Arc::new(DataType::Float32),
         Volatility::Immutable,
         predict,
@@ -196,6 +188,7 @@ fn predict(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut result = Vec::new();
     let mut num_rows = 0;
     let mut dim_names = Vec::new();
+    println!("args len: {}", args.len());
 
     for arg in args {
         let (result_col, num_rows_col, dim_names_col) = to_dense(arg)?;
@@ -208,6 +201,7 @@ fn predict(args: &[ArrayRef]) -> Result<ArrayRef> {
         .map(|x| x as u8 as f32)
         .collect::<Vec<f32>>();
     let dmat = DMatrix::from_dense(&data_transform, num_rows).unwrap();
+    println!("dmat shape: {:?}", dmat.shape());
     let booster = Booster::load("model.xgb").unwrap();
     let result = Float32Array::from(booster.predict(&dmat).unwrap());
 
