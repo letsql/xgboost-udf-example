@@ -122,7 +122,7 @@ fn bench_mushrooms_read(c: &mut Criterion) {
         b.to_async(Runtime::new().unwrap())
             .iter(|| run_sql(&ctx, &sql))
     });
-    }
+}
 
 criterion_group!(
     benches,

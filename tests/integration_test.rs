@@ -91,20 +91,23 @@ async fn it_trains_a_model() -> Result<()> {
     // configure objectives, metrics, etc.
     let learning_params = parameters::learning::LearningTaskParametersBuilder::default()
         .objective(parameters::learning::Objective::BinaryLogistic)
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     // configure the tree-based learning model's parameters
     let tree_params = parameters::tree::TreeBoosterParametersBuilder::default()
-            .max_depth(6)
-            .eta(0.1)
-            .build().unwrap();
+        .max_depth(6)
+        .eta(0.1)
+        .build()
+        .unwrap();
 
     // overall configuration for Booster
     let booster_params = parameters::BoosterParametersBuilder::default()
         .booster_type(parameters::BoosterType::Tree(tree_params))
         .learning_params(learning_params)
         .verbose(true)
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     // specify datasets to evaluate against during training
     let evaluation_sets = [(&dmat, "train")];
@@ -112,11 +115,12 @@ async fn it_trains_a_model() -> Result<()> {
     println!("dmat shape: {:?}", dmat.shape());
     // specify overall training setup// overall configuration for training/evaluation
     let training_params = parameters::TrainingParametersBuilder::default()
-        .dtrain(&dmat)                         // dataset to train with
-        .boost_rounds(2)                         // number of training iterations
-        .booster_params(booster_params)          // model parameters
-//        .evaluation_sets(Some(&evaluation_sets)) // optional datasets to evaluate against in each iteration
-        .build().unwrap();
+        .dtrain(&dmat) // dataset to train with
+        .boost_rounds(2) // number of training iterations
+        .booster_params(booster_params) // model parameters
+        //        .evaluation_sets(Some(&evaluation_sets)) // optional datasets to evaluate against in each iteration
+        .build()
+        .unwrap();
 
     // train booster model, and print evaluation metrics
     println!("\nTraining tree booster...");
