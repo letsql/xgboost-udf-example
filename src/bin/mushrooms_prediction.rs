@@ -1,8 +1,7 @@
-use datafusion::error::{Result, DataFusionError};
-use datafusion::{execution::options::CsvReadOptions, prelude::SessionContext};
 use datafusion::arrow::util::pretty::print_batches;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::{execution::options::CsvReadOptions, prelude::SessionContext};
 use xgboost_udf_example::register_udfs;
-
 
 #[tokio::main]
 async fn main() -> Result<(), DataFusionError> {
@@ -18,10 +17,6 @@ async fn main() -> Result<(), DataFusionError> {
                data";
     let batches = ctx.sql(sql).await?.collect().await?;
     print_batches(&batches)?;
-    
 
     Ok(())
 }
-
-
-

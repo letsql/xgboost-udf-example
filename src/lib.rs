@@ -25,17 +25,16 @@ fn onehot(args: &[ArrayRef]) -> Result<ArrayRef> {
         ]),
         2,
     );
+
     let mut list_builder = ListBuilder::new(struct_builder);
-    for i in 0..key.len() {
-        for j in 0..values.len() {
-            let key_value = key.value(i) as usize;
-            let struct_key = values.value(j);
-            let struct_value = j == key_value;
+    for key_value in key.iter() {
+        for (j, struct_key) in values.iter().enumerate() {
+            let struct_value = j == key_value.unwrap() as usize;
             list_builder
                 .values()
                 .field_builder::<StringBuilder>(0)
                 .unwrap()
-                .append_value(struct_key);
+                .append_value(struct_key.unwrap());
             list_builder
                 .values()
                 .field_builder::<BooleanBuilder>(1)
