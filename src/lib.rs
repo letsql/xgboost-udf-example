@@ -185,21 +185,42 @@ pub fn create_dmatrix(data: &RecordBatch) -> Result<DMatrix, DataFusionError> {
 
 fn predict(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut result = Vec::new();
-    let mut num_rows = 0;
-    let mut dim_names = Vec::new();
+    let mut num_rows_final = 0;
     println!("args len: {}", args.len());
 
     for arg in args {
-        let (result_col, num_rows_col, dim_names_col) = to_dense(arg)?;
-        result.extend(result_col);
-        num_rows = num_rows_col;
-        dim_names.extend(dim_names_col);
+        let (result_col, num_rows, _dim_names_col) = to_dense(arg)?;
+        let chunks = result_col.chunks(result_col.len() / num_rows);
+
+        if result.is_empty() {
+            for chunk in chunks {
+                result.push(
+                    chunk
+                        .into_iter()
+                        .map(|x| *x as u8 as f32)
+                        .collect::<Vec<f32>>(),
+                )
+            }
+            num_rows_final = num_rows;
+
+        } else {
+            for (index, chunk) in chunks.enumerate() {
+                result.get_mut(index).unwrap().extend(
+                    chunk
+                        .into_iter()
+                        .map(|x| *x as u8 as f32)
+                        .collect::<Vec<f32>>(),
+                )
+            }
+        }
     }
-    let data_transform = result
-        .into_iter()
-        .map(|x| x as u8 as f32)
-        .collect::<Vec<f32>>();
-    let dmat = DMatrix::from_dense(&data_transform, num_rows).unwrap();
+
+    let mut data_transform : Vec<f32> = Vec::new();
+    for re in result {
+        data_transform.extend(re);
+    }
+
+    let dmat = DMatrix::from_dense(&data_transform, num_rows_final).unwrap();
     println!("dmat shape: {:?}", dmat.shape());
     let booster = Booster::load("model.xgb").unwrap();
     let result = Float32Array::from(booster.predict(&dmat).unwrap());
