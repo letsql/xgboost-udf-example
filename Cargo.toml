@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 datafusion = "34.0.0"
+gbdt = { git = "https://github.com/mesejo/gbdt-rs.git", branch = "feature/improve-feature-detection" }
 tokio = { version = "1.35.0", features = ["full"] }
 xgboost = "0.1.4"
 

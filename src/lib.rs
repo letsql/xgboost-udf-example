@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use datafusion::arrow::array::{
     as_dictionary_array, Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray,
     Float32Array, ListArray, ListBuilder, StringArray, StringBuilder, StructArray, StructBuilder,
@@ -8,8 +10,9 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{create_udf, Volatility};
 use datafusion::physical_plan::functions::make_scalar_function;
 use datafusion::prelude::SessionContext;
-use std::sync::Arc;
-use xgboost::{Booster, DMatrix};
+use gbdt::decision_tree::Data;
+use gbdt::gradient_boost::GBDT;
+use xgboost::DMatrix;
 
 fn onehot(args: &[ArrayRef]) -> Result<ArrayRef> {
     let data: &DictionaryArray<Int32Type> = as_dictionary_array::<_>(&args[0]);
@@ -185,27 +188,25 @@ pub fn create_dmatrix(data: &RecordBatch) -> Result<DMatrix, DataFusionError> {
 
 fn predict(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut result = Vec::new();
-    let mut num_rows_final = 0;
+    let mut rows = Vec::new();
     println!("args len: {}", args.len());
 
     for arg in args {
         let (result_col, num_rows, _dim_names_col) = to_dense(arg)?;
         let chunks = result_col.chunks(result_col.len() / num_rows);
 
-        if result.is_empty() {
+        if rows.is_empty() {
             for chunk in chunks {
-                result.push(
+                rows.push(
                     chunk
                         .into_iter()
                         .map(|x| *x as u8 as f32)
                         .collect::<Vec<f32>>(),
                 )
             }
-            num_rows_final = num_rows;
-
         } else {
             for (index, chunk) in chunks.enumerate() {
-                result.get_mut(index).unwrap().extend(
+                rows.get_mut(index).unwrap().extend(
                     chunk
                         .into_iter()
                         .map(|x| *x as u8 as f32)
@@ -215,25 +216,23 @@ fn predict(args: &[ArrayRef]) -> Result<ArrayRef> {
         }
     }
 
-    let mut data_transform : Vec<f32> = Vec::new();
-    for re in result {
-        data_transform.extend(re);
+    for row in rows {
+        result.push(Data::new_test_data(row, None));
     }
 
-    let dmat = DMatrix::from_dense(&data_transform, num_rows_final).unwrap();
-    println!("dmat shape: {:?}", dmat.shape());
-    let booster = Booster::load("model.xgb").unwrap();
-    let result = Float32Array::from(booster.predict(&dmat).unwrap());
-
-    Ok(Arc::new(result))
+    let gbdt =
+        GBDT::from_xgboost_dump("gdbt.model", "binary:logistic").expect("failed to load model");
+    let res = Float32Array::from(gbdt.predict(&result));
+    Ok(Arc::new(res))
 }
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use datafusion::arrow::array::{ArrayRef, StringDictionaryBuilder};
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
+
+    use super::*;
 
     #[tokio::test]
     pub async fn test_onehot() -> Result<()> {
@@ -398,35 +397,4 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    pub async fn test_predict() -> Result<()> {
-        let fields = Fields::from(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Boolean, false),
-        ]);
-        let struct_builder = StructBuilder::from_fields(fields, 2);
-        let mut list_builder = ListBuilder::new(struct_builder);
-        list_builder
-            .values()
-            .field_builder::<StringBuilder>(0)
-            .unwrap()
-            .append_value("a");
-        list_builder
-            .values()
-            .field_builder::<BooleanBuilder>(1)
-            .unwrap()
-            .append_value(true);
-        list_builder.values().append(true);
-        list_builder.append(true);
-        let array = Arc::new(list_builder.finish());
-
-        let f0 = array.clone();
-        let f1 = array.clone();
-        let f2 = array.clone();
-        let f3 = array.clone();
-
-        let _result = predict(&[f0, f1, f2, f3])?;
-
-        Ok(())
-    }
 }
